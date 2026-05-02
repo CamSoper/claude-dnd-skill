@@ -10,6 +10,73 @@ Versions before **1.6.0** are reconstructed retroactively from git history; the 
 
 ## [Unreleased]
 
+## [1.7.5] — 2026-05-01 — Display robustness: send.py + tail persistence + arc pre-emption
+
+Three long-standing reliability bugs land hard fixes in this release. Each one had been tripping live sessions repeatedly; the fixes are structural rather than patch-shaped, with regression tests so they don't come back.
+
+### What changed
+
+**send.py — body-bundling restored, integrity checks added**
+
+The bug: when `--stat-*` flags were combined with a heredoc body (the documented pattern for bundling state changes with narration), `send.py` would dispatch the stat update but silently drop the narration text. Root cause was in the stdin-read decision: `_build_stats_payload(args)` was being treated as a "body-less" signal, so reading stdin was skipped even when a heredoc was attached.
+
+- **Stdin decision rewritten.** Three categories are now distinguished cleanly:
+  - Content flags (`--player`/`--npc`/`--dice`/`--tutor`/`--action`) → body required, stdin always read.
+  - Truly body-less flags (`--inspiration-*`, `--xp-award`, `--milestone-*`) → stdin never read; safe in chained Bash blocks.
+  - Stat flags (`--stat-*`, `--effect-*`) → body OPTIONAL; stdin is read when piped (heredoc), skipped when an interactive TTY (avoids blocking).
+
+- **Pre-flight integrity checks.** Before posting, every payload runs through `_validate_payload(...)`: chunk payloads must have text or an award; multiple content tags (e.g. `--player` + `--npc`) are rejected; stats payloads must carry a list. Validation failures abort with `sys.exit(2)` and a clear stderr line including the offending payload — no more silent drops.
+
+- **HTTP-level receipt verification.** The `_post(...)` helper now logs every send to a per-process `_SEND_LOG` and inspects the response status. Non-2xx responses surface the body excerpt to stderr. Connection refused (display offline) is the only "expected" silent failure.
+
+- **Post-flight self-check.** After all sends, the script tallies failures from `_SEND_LOG`. Display-offline yields one quiet stderr line; any other partial failure yields a `PARTIAL FAILURE` summary and `sys.exit(3)` so the caller can react.
+
+- **Optional `--verify` round-trip.** When set, after sending the script GETs the new `/health` endpoint to confirm the server is processing requests. Mismatches surface clearly. Use during dev/debug.
+
+**dnd-display-app.py — non-destructive tail persistence + atomic writes**
+
+The bug: `session_tail.json` was being silently wiped to `[]` between sessions, so `/dnd load` had no last-scene replay to play back. Replay had only worked once or twice across many sessions.
+
+Root cause traced to a filtering+persistence chain in the tail buffer code. `_load_tail()` cleared the buffer first then re-appended campaign-filtered entries; if every entry filtered out (or the file was empty), the buffer ended up zeroed. The next `_persist_tail()` then wrote `[]` over the file. With dual-path resolution (campaign-side vs legacy fallback), the failure was hard to pin down.
+
+- **`_load_tail` is now non-destructive.** Builds a candidate buffer first, only swaps it in if at least one entry survived filtering. Empty file → buffer left alone. All-filtered → buffer left alone. Corrupt JSON → buffer left alone, error logged.
+
+- **`_persist_tail` skips on empty.** Refuses to overwrite an existing non-empty file with an empty buffer. Logs a stderr warning when it does so. Breaks the "wipe → persist → file lost" chain at the persistence end too.
+
+- **Atomic writes.** `_persist_tail` writes to `<path>.tmp` then `os.replace(...)` — readers (the next `/dnd load`) can never see a partial or zero-byte state.
+
+- **Legacy fallback path removed.** The skill-side `~/.claude/skills/dnd/display/session_tail.json` fallback is gone. Tails only ever land in the campaign-specific path. If `CAMP_FILE` is missing/empty, persist holds the buffer in memory and skips disk — no more silent bleed across campaigns.
+
+- **`/health` endpoint added.** Returns `alive`, `tail_buffer` count, `tail_file_size`, `text_log` count, `campaign`, `clients`. No auth required (no PII). Used by `send.py --verify` and external monitors.
+
+**`/dnd end` tail backstop + `verify_tail.sh` + `write_canonical_tail.py`**
+
+Even with the in-process guards above, `/dnd end` now belt-and-suspenders the tail:
+
+- Before killing the display, `verify_tail.sh <campaign>` checks the on-disk tail is healthy (>50 bytes, parses as a non-empty JSON list, entries have recognizable shape). Exit 0 = healthy; exit 1 = unsafe to rely on.
+- If unhealthy, the DM writes a canonical replacement directly to disk via `write_canonical_tail.py` from session context — bypasses the display entirely so the file is good even if the server died unexpectedly. Atomic write, campaign-stamped, capped at 30 entries.
+- Re-verification post-kill catches any final-write race.
+
+**Beat 2b structural fix — pre-emption is a revision trigger**
+
+The bug (campaign-level): when players act faster than the world, the `world_pressure` event for an outstanding beat plays out fully without the beat's `what_changes` consequence landing. Beats were going stale and steering notes were being rewritten manually.
+
+Root cause: dynamic-arc beats were being generated with `what_changes` written event-shaped (something specific happens) when it should be consequence-shaped (something fundamentally different is true).
+
+- **SKILL.md rule 8 added (Pre-emption is a revision trigger).** When `world_pressure` delivers but the consequence doesn't land, this triggers `/dnd arc revise` automatically at `/dnd end`. Three landing-path templates: **cost path** (the party paid for moving fast), **secondary consequence path** (the world responds to being pre-empted in a way the party didn't anticipate), **deferred path** (rewrite `world_pressure` toward the same consequence on a longer horizon).
+- **`/dnd new` step 12 strengthened.** Arc-generation prompt now explicitly demands `what_changes` be consequence-shaped, with worked event-vs-consequence example.
+- **`/dnd end` arc-check rewritten.** Now performs an explicit pre-emption check on each outstanding beat and auto-triggers `/dnd arc revise` when needed. The DM doesn't have to spot it.
+- **`/dnd arc revise` enhanced.** Surfaces the three landing-path templates as a structured choice; before/after diff for the affected beat is shown for review.
+
+### Tests
+
+- New `tests/test_display_robustness.py` (18 tests) covers:
+  - Stdin-read decision across all flag combinations including the bundled-stat regression
+  - Payload validation (text-or-award required, multiple-content-tags rejected, stats-as-list)
+  - Tail load: empty file / filtered-out / matching / corrupt JSON / missing CAMP_FILE
+  - Tail persist: skip-on-empty-over-content / atomic / no-camp-no-write
+- All 80 tests in the suite pass.
+
 ## [1.7.4] — 2026-05-01 — Stack-based milestone counter (backport from open-tabletop-gm v0.9.0)
 
 A counted milestone counter for the rewards that don't fit Inspiration's binary shape — Bardic Inspiration dice, homebrew Hero Coins, Fate Tokens, alternate-system reward tokens, anything that *accumulates*. The existing Inspiration code is unchanged; the binary gold badge in the sidebar still works as before. This release adds a parallel, stack-based reward UI alongside it.

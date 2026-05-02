@@ -33,8 +33,10 @@ Full step-by-step procedures for all `/dnd` slash commands. Load this file at `/
    - **`resolution`** — the committed endpoint shape: if the party succeeds, what's the emotional truth? Keep specific events open; commit to the shape.
    - **Acts 1–3**, each with 2 beats. Each beat has:
      - `label` — a dramatic name
-     - `what_changes` — before/after: what's fundamentally different once this lands?
-     - `world_pressure` — the specific faction or NPC move (naming actual entities from this world) that makes the beat feel inevitable
+     - `what_changes` — before/after: what's fundamentally different once this lands? **CRITICAL: write this as a CONSEQUENCE, not an event.** A consequence is a state-of-the-world after the beat. An event is one specific thing that happens. Consequences survive when players pre-empt the obvious event delivery; events break and the beat goes stale. Example contrast for a 2b "All Is Lost" beat:
+       - ❌ Event-shaped (fragile): *"Vedra's nomination succeeds and she takes the third seat."* If the party flips the clerk, this can't land — beat goes stale.
+       - ✅ Consequence-shaped (robust): *"The party experiences a concrete cost from the Kept's escalation that they cannot reverse — a cover blown, an ally compromised, or a position they relied on no longer available."* This survives multiple delivery paths.
+     - `world_pressure` — the specific faction or NPC move (naming actual entities from this world) that makes the beat feel inevitable. This MAY be event-shaped — but if the players pre-empt it, you're expected to revise per SKILL.md rule 8 (pre-emption is a revision trigger).
    - **`steering_notes`** — how to reach the first beat without forcing it
 
    Beat layout:
@@ -287,7 +289,14 @@ If nothing changed in a category this session, leave it as-is. If a fact was wro
 
 Then update `## Faction Moves` in state.md: for each active faction, answer *"what did they do while the party was occupied?"* One line per faction — even if nothing visible yet. Confirm what was written.
 
-**Session tail archive:** `dnd-display-app.py` continuously writes `~/.claude/skills/dnd/display/session_tail.json` — this is always current. At save time, also write the tail as a named session snapshot: `~/.claude/dnd/campaigns/<name>/session-tail.md` (SKILL-side human-readable, already done by the DM narration) **and** verify `session_tail.json` exists and is non-empty. If it is missing or empty (e.g. the display was not running), write it from the last narration block and player inputs available in context.
+**Session tail archive:** `dnd-display-app.py` continuously writes `~/.claude/dnd/campaigns/<name>/session_tail.json` — campaign-specific path, atomic-write, skip-on-empty guarded (since 2026-05-01). At save time:
+
+1. Verify the campaign-side file exists and is non-empty:
+   ```bash
+   bash ~/.claude/skills/dnd/display/verify_tail.sh <campaign-name>
+   ```
+   The script returns 0 if the tail is healthy (non-empty + valid JSON list), 1 if missing/empty/corrupt. If it returns 1, the tail is unsafe to rely on for next session's replay — **write a canonical replacement directly to the campaign path** with this session's 5–8 most important narrative beats as a JSON list of `{"text": "...", "_camp": "<name>"}` entries (no display call needed; the display may already be dead). Use the `tools/write_canonical_tail.py` helper.
+2. Also write `~/.claude/dnd/campaigns/<name>/session-tail.md` (human-readable snapshot — companion to the JSON, used as fallback during /dnd load if JSON read fails).
 
 **Session log archival (run on every save after session count > 3):**
 session-log.md keeps only the **2 most recent full session entries**. Older entries move to `session-log-archive.md` (append, never delete). Before archiving each entry, extract a 3–5 bullet continuity summary and write it to `## Continuity Archive` in state.md. Format:
@@ -328,14 +337,26 @@ If `graph.json` doesn't exist yet for this campaign, skip the sweep entirely (no
    b. Ask: *"Quick calibration — what worked this session, and what would you adjust next time?"* Write answers to `### DM Calibration`. If skipped, leave blank.
    c. Update `## World State` in state.md: check whether events advanced the threat arc stage, shifted faction states, or changed the in-world date. Update all three.
    d. If the calibration response reveals a new pattern (or confirms/contradicts an existing one), update `## DM Style Notes` in state.md. Add new bullets; refine existing ones if the pattern has sharpened. Do not log every session — only update when something genuinely new or changed is observed.
-   e. **Arc check** (dynamic arcs only — skip for sandbox/structured): If `## Campaign Arc` has `type: dynamic`, review this session's key events against `outstanding_beats`. Ask: *"Did any arc beats land this session? [beat id(s) like '1b 2a', or 'none']"*
-      - If beats landed: run `/dnd arc advance <beat-id>` for each. Update `steering_notes` for the next outstanding beat.
-      - If none: check whether `world_pressure` for the next outstanding beat should appear in this session's Faction Moves entry. If yes, note it there — it should land next session.
-2. If `_display_running = true`, stop the display:
+   e. **Arc check** (dynamic arcs only — skip for sandbox/structured): If `## Campaign Arc` has `type: dynamic`, do all of:
+
+      i. Ask: *"Did any arc beats land this session? [beat id(s) like '1b 2a', or 'none']"*
+      ii. If beats landed: run `/dnd arc advance <beat-id>` for each.
+      iii. **Pre-emption check (critical — added 2026-05-01):** for each remaining outstanding beat whose `world_pressure` was visibly delivered this session (the world event named in the beat actually appeared in narration or Faction Moves), evaluate whether the beat's `what_changes` consequence ALSO landed. Three possible states:
+        - **Landed cleanly** → mark beat complete (step ii).
+        - **Did not land — pressure absorbed without consequence** → the beat is overdue and its current shape no longer fits. **Run `/dnd arc revise` immediately**; do not just update `steering_notes`. The beat's `what_changes` was event-shaped (something specific happens) when it should be consequence-shaped (something fundamentally different is true) — revise both `what_changes` and `world_pressure` to fit a path that DOES land. The committed shape bends; it does not break.
+        - **Pressure not yet delivered** → leave beat alone; expected to deliver next session.
+      iv. Update `steering_notes` for the next outstanding beat with the *consequence shape* expected, not the specific event.
+   f. **Tail verification (added 2026-05-01):** before killing the display, verify the campaign-side `session_tail.json` is healthy:
+      ```bash
+      bash ~/.claude/skills/dnd/display/verify_tail.sh <campaign-name>
+      ```
+      Exit 0 = healthy. Exit 1 = missing/empty/corrupt → write a canonical replacement to `~/.claude/dnd/campaigns/<name>/session_tail.json` from session context (5–8 entries, each `{"text": "...", "_camp": "<name>"}`) BEFORE the display kill — once the display is dead, only the file matters. The display's own `_persist_tail` has skip-on-empty + atomic-write guards, but the backstop ensures a worst-case file state is impossible.
+2. Stop the display (always — even if `_display_running` was unclear):
    ```bash
    kill $(cat ~/.claude/skills/dnd/display/app.pid 2>/dev/null) 2>/dev/null
    rm -f ~/.claude/skills/dnd/display/app.pid
    ```
+3. **Post-kill tail re-verification:** run `verify_tail.sh` once more after the kill. If it now reports unhealthy (file got truncated by a final write race), restore from the canonical version written in step 1f.
 
 ---
 
@@ -572,13 +593,17 @@ Manage the dynamic campaign arc. Active only when `state.md → ## Campaign Arc`
   8. Deliver a one-paragraph summary of the new arc's premise and how it differs from the previous one.
 
 - **`/dnd arc view`** — show full arc: theme, resolution, all acts and beats with completion status (current / complete / pending). If `## Arc History` exists, show a one-line summary of each completed arc above the current one.
-- **`/dnd arc revise`** — open revision flow for when the story has taken a major unexpected turn:
-  1. Show all outstanding beats.
-  2. Ask: *"What's changed in the story that the arc doesn't reflect?"*
-  3. Rewrite `what_changes` and/or `world_pressure` for affected outstanding beats to fit the new direction. Do not modify completed beats.
-  4. Append to `revision_log`: `"<date>: <what changed and why — one sentence>"`
-  5. Update `steering_notes`.
-  6. Confirm what was revised.
+- **`/dnd arc revise`** — open revision flow for when the story has taken a major unexpected turn OR when the auto-trigger from /dnd end's pre-emption check fires (most common case):
+  1. Show all outstanding beats with their current `what_changes` and `world_pressure`.
+  2. Ask: *"What's changed in the story that the arc doesn't reflect?"* — or, when auto-triggered by pre-emption, name the pre-empted beat directly: *"Beat 2b's pressure delivered but the consequence didn't land. Picking a revision path…"*
+  3. **Apply one of three landing-path templates** (per SKILL.md rule 8) to the affected outstanding beat:
+     - **Cost path** — `what_changes` becomes "the party paid a concrete cost for moving fast"; `world_pressure` becomes the specific cost (cover blown, ally compromised, position lost). Best when the party pre-empted cleanly.
+     - **Secondary consequence path** — `what_changes` becomes "the world responded to being pre-empted in a way the party didn't anticipate"; `world_pressure` becomes the new escalation (the antagonist reads the disruption as a signal and does something WORSE). Best when the antagonist is intelligent and adaptive.
+     - **Deferred path** — keep the original `what_changes` shape; rewrite `world_pressure` to a NEW pressure pointing at the same consequence, scheduled for the next 1–2 sessions. Best when the original consequence is still narratively essential and only the timing slipped.
+  4. Rewrite `what_changes` (consequence-shaped per the rule in /dnd new step 12) and `world_pressure` (event-shaped is fine) for the affected beat. Do NOT modify completed beats.
+  5. Append to `revision_log`: `"<date>: <beat-id> — <path: cost/secondary/deferred> — <what changed and why — one sentence>"`
+  6. Update `steering_notes` to describe the next session's expected delivery.
+  7. Confirm what was revised. Show before/after for `what_changes` and `world_pressure`.
 
 ---
 

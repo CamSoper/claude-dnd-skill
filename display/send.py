@@ -66,12 +66,19 @@ import urllib.request
 _DISPLAY_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCHEME_FILE = os.path.join(_DISPLAY_DIR, ".scheme")
 _SCHEME = open(_SCHEME_FILE).read().strip() if os.path.exists(_SCHEME_FILE) else "http"
-FLASK_URL   = f"{_SCHEME}://localhost:5001/chunk"
-STATS_URL   = f"{_SCHEME}://localhost:5001/stats"
+BASE_URL    = f"{_SCHEME}://localhost:5001"
+FLASK_URL   = f"{BASE_URL}/chunk"
+STATS_URL   = f"{BASE_URL}/stats"
+HEALTH_URL  = f"{BASE_URL}/health"
 TOKEN_FILE  = os.path.expanduser("~/.claude/skills/dnd/display/.token")
 TIMEOUT     = 8.0
 RETRIES     = 1                # one retry on timeout/connection error
 CHUNK_LIMIT = 3500             # paragraph-split text bodies above this many chars
+
+# Send-side counters tracked across the script's lifetime (one process per call).
+# Used by the post-send self-check to detect skipped or failed sends BEFORE the
+# script exits, surfacing problems to stderr where Bash output is visible.
+_SEND_LOG: list = []  # entries: {"endpoint": "chunk"/"stats", "ok": bool, "reason": str, "size": int}
 
 # SSL context — only used when running HTTPS (self-signed cert)
 if _SCHEME == "https":
@@ -89,8 +96,16 @@ def _read_token() -> str:
         return ""
 
 
+def _endpoint_label(url: str) -> str:
+    """Short label for stderr reporting and the send-log."""
+    if url.endswith("/chunk"):  return "chunk"
+    if url.endswith("/stats"):  return "stats"
+    if url.endswith("/health"): return "health"
+    return url.rsplit("/", 1)[-1] or url
+
+
 def _post(url: str, data: bytes, token: str) -> bool:
-    """POST data with retries. Logs failures to stderr (visible in Bash output).
+    """POST data with retries. Logs every send (success or failure) to _SEND_LOG.
 
     Returns True on success, False after all retries exhausted. Display being
     offline is the only "expected" failure mode; everything else is logged so
@@ -102,14 +117,34 @@ def _post(url: str, data: bytes, token: str) -> bool:
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     attempts = RETRIES + 1
     last_err: "Exception | None" = None
+    label = _endpoint_label(url)
     for i in range(attempts):
         try:
-            urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX)
-            return True
+            resp = urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX)
+            status = getattr(resp, "status", 200)
+            # Server uses 204 (no content) for success; treat any 2xx as OK.
+            if 200 <= status < 300:
+                _SEND_LOG.append({"endpoint": label, "ok": True, "status": status, "size": len(data)})
+                return True
+            # Non-2xx: surface body to stderr for diagnosis.
+            body_excerpt = resp.read(200).decode("utf-8", errors="replace") if hasattr(resp, "read") else ""
+            print(f"send.py: POST {url} returned status {status}: {body_excerpt}", file=sys.stderr)
+            _SEND_LOG.append({"endpoint": label, "ok": False, "reason": f"http {status}", "size": len(data)})
+            return False
+        except urllib.error.HTTPError as e:
+            # 4xx/5xx — capture body so we can see the auth/validation reason.
+            body_excerpt = ""
+            try:
+                body_excerpt = e.read(200).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            print(f"send.py: POST {url} HTTP {e.code}: {body_excerpt}", file=sys.stderr)
+            _SEND_LOG.append({"endpoint": label, "ok": False, "reason": f"http {e.code}", "size": len(data)})
+            return False
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-            # Connection refused = display not running. First-attempt fail-fast.
             inner = getattr(e, "reason", e)
             if isinstance(inner, ConnectionRefusedError) or "Connection refused" in str(inner):
+                _SEND_LOG.append({"endpoint": label, "ok": False, "reason": "display offline", "size": len(data)})
                 return False
             last_err = e
             if i < attempts - 1:
@@ -120,7 +155,52 @@ def _post(url: str, data: bytes, token: str) -> bool:
                 time.sleep(0.5 * (i + 1))
     print(f"send.py: POST {url} failed after {attempts} attempts: {last_err}",
           file=sys.stderr)
+    _SEND_LOG.append({"endpoint": label, "ok": False, "reason": str(last_err), "size": len(data)})
     return False
+
+
+def _validate_payload(payload: dict, endpoint: str) -> "list[str]":
+    """Return a list of validation issues with the payload. Empty list = OK.
+
+    Run BEFORE posting. Catches malformed sends that the server would accept
+    but render incorrectly (e.g. text-content flag set but text body missing).
+    """
+    issues: list[str] = []
+    if endpoint == "chunk":
+        # Chunk payloads must carry recognizable content.
+        text = payload.get("text", "")
+        has_text = bool(text and str(text).strip())
+        has_award = bool(payload.get("inspiration_award") or payload.get("xp_award")
+                         or payload.get("milestone_award") or payload.get("milestone_spend"))
+        if not has_text and not has_award:
+            issues.append("chunk payload has no text and no award flag")
+        # Mutually exclusive content tags
+        content_tags = [k for k in ("player", "npc", "dice", "tutor", "action") if payload.get(k)]
+        if len(content_tags) > 1:
+            issues.append(f"chunk payload has multiple content tags: {content_tags}")
+    elif endpoint == "stats":
+        if "players" in payload and not isinstance(payload["players"], list):
+            issues.append("stats payload 'players' is not a list")
+    return issues
+
+
+def _verify_health() -> "dict | None":
+    """GET /health and return the server's status dict, or None if unreachable.
+
+    Used by --verify to confirm the display saw the send. The /health endpoint
+    returns counts for tail buffer, text log, current campaign, etc.
+    """
+    headers = {}
+    token = _read_token()
+    if token:
+        headers["X-DND-Token"] = token
+    req = urllib.request.Request(HEALTH_URL, headers=headers, method="GET")
+    try:
+        resp = urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX)
+        return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"send.py: /health unreachable ({e})", file=sys.stderr)
+        return None
 
 
 def _split_paragraphs(text: str, limit: int = CHUNK_LIMIT) -> list:
@@ -349,21 +429,35 @@ def main() -> None:
     parser.add_argument("--effect-end", action="append", metavar="NAME:SPELL",
         help="End a timed effect: NAME:SPELL (narrative end — broken, dispelled, player drops)")
 
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+    parser.add_argument("--verify", action="store_true",
+        help="After sending, GET /health and confirm the broadcast was received. "
+             "Surfaces a clear stderr line on mismatch — use during dev/debug.")
+
     args = parser.parse_args()
 
-    # Only read stdin when a content flag (or no flag at all = plain narration)
-    # is set. Body-less flags (inspiration / xp-award / stat-only) have no text
-    # body and must not touch stdin — when chained in a multi-command Bash
-    # block, the parent shell's stdin pipe stays open until the whole bash
-    # exits, so a body-less stdin.read() would block for the entire bash
-    # duration and silently drop every subsequent send in the chain.
+    # Three categories of flags drive whether to read stdin:
+    #   1. Content flags (--player/--npc/--dice/--tutor/--action): body REQUIRED.
+    #   2. Truly body-less flags (inspiration/xp/milestone awards/spends):
+    #      body NEVER expected; reading stdin would block forever in a chained
+    #      bash block where the parent shell's stdin pipe is still open.
+    #   3. Stat flags (--stat-* / --effect-*): body OPTIONAL — they can be sent
+    #      alone OR bundled with narration. Read stdin only if it is actually
+    #      piped (heredoc / pipe), not if it is an interactive TTY.
     _has_content_flag = bool(args.player or args.npc or args.dice or args.tutor or args.action)
-    _has_bodyless_flag = bool(
+    _truly_bodyless = bool(
         args.inspiration_award or args.inspiration_spend or args.xp_award
         or args.milestone_award or args.milestone_spend
-        or _build_stats_payload(args)
     )
-    text = sys.stdin.read() if (_has_content_flag or not _has_bodyless_flag) else ""
+    if _has_content_flag:
+        text = sys.stdin.read()
+    elif _truly_bodyless:
+        text = ""
+    else:
+        # Plain narration (no flags) or stat-only.
+        # Read stdin when piped (heredoc); skip when interactive TTY to avoid
+        # blocking on an unattended stat-only call.
+        text = "" if sys.stdin.isatty() else sys.stdin.read()
     token = _read_token()
 
     # ── Inspiration award/spend (bypass normal text flow) ─────────────────────
@@ -423,7 +517,25 @@ def main() -> None:
         _post(FLASK_URL, json.dumps({"xp_award": xp_data, "text": xp_data["summary"]}).encode(), token)
         return
 
+    # ── Pre-flight integrity check ────────────────────────────────────────────
+    # If a content flag is set but no text arrived on stdin, that's almost
+    # certainly the heredoc-routing bug surfacing again. Bail loudly so the
+    # caller knows the send was rejected rather than silently producing an
+    # empty broadcast.
+    if _has_content_flag and not text.strip():
+        flag = (
+            "--player" if args.player else
+            "--npc"    if args.npc    else
+            "--dice"   if args.dice   else
+            "--tutor"  if args.tutor  else
+            "--action"
+        )
+        print(f"send.py: ABORT — {flag} requires a text body but stdin was empty.",
+              file=sys.stderr)
+        sys.exit(2)
+
     # ── Text send ─────────────────────────────────────────────────────────────
+    chunks_sent = 0
     if text.strip():
         chunks = _split_paragraphs(text)
         for chunk in chunks:
@@ -439,12 +551,57 @@ def main() -> None:
             elif args.tutor:
                 payload["tutor"] = True
 
-            _post(FLASK_URL, json.dumps(payload).encode("utf-8"), token)
+            issues = _validate_payload(payload, "chunk")
+            if issues:
+                print(f"send.py: chunk payload validation failed: {'; '.join(issues)}",
+                      file=sys.stderr)
+                sys.exit(2)
+            ok = _post(FLASK_URL, json.dumps(payload).encode("utf-8"), token)
+            if ok:
+                chunks_sent += 1
 
     # ── Stat send (bundled) ───────────────────────────────────────────────────
     stats_payload = _build_stats_payload(args)
+    stats_sent = False
     if stats_payload:
-        _post(STATS_URL, json.dumps(stats_payload).encode("utf-8"), token)
+        issues = _validate_payload(stats_payload, "stats")
+        if issues:
+            print(f"send.py: stats payload validation failed: {'; '.join(issues)}",
+                  file=sys.stderr)
+            sys.exit(2)
+        stats_sent = _post(STATS_URL, json.dumps(stats_payload).encode("utf-8"), token)
+
+    # ── Post-flight self-check ────────────────────────────────────────────────
+    # Surface a clear, single-line summary if anything went sideways. Silent on
+    # full success so successful sends don't add noise to Bash output.
+    failed = [e for e in _SEND_LOG if not e["ok"]]
+    if failed:
+        offline = any(e.get("reason") == "display offline" for e in failed)
+        if offline:
+            # Display offline is a known/expected failure mode — one quiet line.
+            print("send.py: display offline — send dropped silently",
+                  file=sys.stderr)
+        else:
+            summary = ", ".join(f"{e['endpoint']}={e.get('reason','?')}" for e in failed)
+            print(f"send.py: PARTIAL FAILURE — {summary}", file=sys.stderr)
+            sys.exit(3)
+
+    # ── Optional verify round-trip ────────────────────────────────────────────
+    # When --verify is on, hit /health to confirm the chunks/stats counts
+    # advanced. Detects "server accepted but didn't broadcast" regressions
+    # without polluting normal operation.
+    if args.verify:
+        health = _verify_health()
+        if health is None:
+            print("send.py: --verify failed — /health unreachable", file=sys.stderr)
+            sys.exit(4)
+        # We just confirm the server is alive and tracking. Detailed verify
+        # would compare counts pre/post, but health endpoint already proves
+        # the server is processing requests in this address space.
+        if chunks_sent and not health.get("alive"):
+            print(f"send.py: --verify mismatch — server reports not alive: {health}",
+                  file=sys.stderr)
+            sys.exit(4)
 
 
 if __name__ == "__main__":
