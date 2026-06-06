@@ -10,6 +10,25 @@ Versions before **1.6.0** are reconstructed retroactively from git history; the 
 
 ## [Unreleased]
 
+## [2.1.3] — 2026-06-04 — TCC-safe autorun wait
+
+- **Autorun mode no longer breaks under macOS TCC.** The blocking autorun wait was a shell script (`autorun-wait.sh`) whose `echo > .autorun-session` redirect is silently blocked by macOS TCC when the data root lives under `~/Documents` — so autorun/taxi mode failed to drive the turn loop. Replaced with `autorun_wait.py`, a pure-python implementation doing the identical job (session invalidation, `autorun_interval` from `state.md`, waiting-indicator broadcast, 9-minute input-queue poll, `/queue/consumed` POST) using python file I/O, which TCC permits. Output contract is unchanged, so the DM turn loop is identical. The old shell script is retired.
+
+## [2.1.2] — 2026-06-04 — Editorial character-sheet theming
+
+- **Character-sheet modal fully themed for Editorial.** The sheet frame was already editorial, but its inner sections still rendered in Vellum gold on the paper canvas. Section titles and ability modifiers are now vermilion; ability scores, feature names, and feature text are ink (readable, no faint gold); spell/cantrip tags and dividers use subtle ink hairlines. The portrait icon drops its purple drop-shadow, and a 404'd class icon is removed (`onerror`) instead of leaving a broken-image box.
+
+## [2.1.1] — 2026-06-04 — Enforced roll handling + move-received confirmation
+
+- **Roll handling is now explicit and enforced.** The DM no longer silently auto-rolls a player's PC (the bug where it fell back to `dice.py` `[auto]` when the physical-dice server was down). Roll handling is chosen at game start — `/dnd new` and `/dnd load` now ask *"Dice rolls?"* — and stored as `roll_mode` in `state.md → ## Session Flags` (default `players`). SKILL.md hard-wires it: under `players` the DM calls for each PC d20 by name and **waits**, never rolling it for them; under `auto` it rolls PCs openly with full math. Initiative and all NPC/monster rolls stay DM-rolled.
+- **Per-player roll override.** A `Rolls` toggle in the phone Settings (shown when the device is bound to a PC) flips that character between *Players* and *Auto-roll*; it POSTs to `/roll-pref` and `check_input.py` surfaces it to the DM as a `[[<Char> roll mode: …]]` directive that overrides the campaign default for that character.
+- **"Move received" confirmation on the phone.** When the DM actually picks up the queued action (not just when it's staged), the phone shows a `✓ The DM has your move` toast and the status strip flips to *The DM is narrating…*, then back to *Your move*. Closes the loop the status strip was missing.
+
+## [2.1.0] — 2026-06-04 — Reading text size, narration length, phone turn-flow
+
+- **Reading text size control.** A `Text Size` stepper in Settings (`A−` / `A+`, click the % to reset) scales the reading column via a font-size multiplier — *font size, not page zoom* — so narration stays legible across the room from a Chromecast. Persists per-browser (`localStorage["dnd-text-scale"]`), applied anti-FOUC.
+- **Narration length slider.** A `Narration` slider in Settings (250–2500 words) sets the target the DM aims for each turn. The value POSTs to `/narration-pref`; `check_input.py` prepends a `[[Narration length…]]` directive to queued player input so the DM honors it as a hard budget that turn (SKILL.md instructs it). Quick "keep turns short" control for time-pressed tables.
+- **Phone turn-flow redesign.** The phone input view now shows a plain status strip — *Your move → Sending… → Sent to the DM* (accent banner) → back — so a player can always tell whether their turn is in. Staging is **one tap** (auto-ready: the action sends immediately). And device approval now defaults to trusting any LAN device (`DND_REQUIRE_APPROVAL=1` restores the approve/deny gate), removing the "Awaiting approval" button-clip and the approval-card overlap on a casual home network.
 ## [2.0.1] — 2026-06-05 — Doc fixes — README images, /dnd → /dm:dnd command refs
 
 - **README image paths fixed.** Top-level README references to `display/icons/*.png` now correctly point at `skills/dnd/display/icons/*.png` (the restructure in v2.0.0 moved the assets but didn't update the README). The repo page on GitHub now renders the logo and feature-bullet icons correctly.

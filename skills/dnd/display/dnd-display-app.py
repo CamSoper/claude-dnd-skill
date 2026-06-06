@@ -282,6 +282,13 @@ _load_approved_devices()
 _load_pending_devices()
 
 
+# A casual home-LAN game doesn't need a per-device approval gate — it's friction
+# (every phone sits on "Awaiting approval" until the DM taps a card). Default:
+# trust any device that can already reach the server. Set DND_REQUIRE_APPROVAL=1
+# to restore the approve/deny gate (e.g. on an untrusted/shared network).
+_REQUIRE_APPROVAL = os.environ.get("DND_REQUIRE_APPROVAL", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _device_ok(device_id: str, ip: str) -> str:
     """Return 'approved', 'pending', or 'denied' for a given device."""
     if not device_id:
@@ -293,11 +300,12 @@ def _device_ok(device_id: str, ip: str) -> str:
             return "approved"
         if device_id in _denied_devices:
             return "denied"
-        # Localhost always auto-approved
-        if ip in ("127.0.0.1", "::1"):
+        # Auto-approve localhost always, and every reachable device unless the
+        # approval gate is explicitly required.
+        if not _REQUIRE_APPROVAL or ip in ("127.0.0.1", "::1"):
             _approved_devices.add(device_id)
             _need_persist_approved = True
-        # New LAN device — hold and notify DM
+        # New LAN device with the gate on — hold and notify DM
         elif device_id not in _pending_devices:
             _pending_devices[device_id] = {
                 "id":         device_id,
@@ -1682,6 +1690,60 @@ def audio_toggle():
     return state, 200
 
 
+@app.route("/narration-pref", methods=["POST"])
+def narration_pref():
+    """Set the narration-length target the DM aims for each turn.
+
+    Body: {"target_words": int}.  0 clears the preference. Persisted to the
+    runtime dir as a plain integer; check_input.py reads it and prepends a
+    directive to queued player input so the DM honors it that turn — no
+    separate file read required on the DM side.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        n = int(data.get("target_words", 0))
+    except (TypeError, ValueError):
+        n = 0
+    n = max(0, min(5000, n))
+    pref = rt("narration_target")
+    try:
+        if n:
+            with open(pref, "w") as f:
+                f.write(str(n))
+        elif os.path.exists(pref):
+            os.remove(pref)
+    except OSError:
+        pass
+    return {"target_words": n}, 200
+
+
+@app.route("/roll-pref", methods=["POST"])
+def roll_pref():
+    """Per-character roll preference. Body: {"character": str, "mode": "auto"|"players"}.
+
+    Persisted to runtime roll_prefs.json; check_input.py surfaces each override as a
+    [[<Char> roll mode: …]] directive so the DM honors it for that character,
+    overriding the campaign-wide roll_mode in state.md.
+    """
+    data = request.get_json(silent=True) or {}
+    char = (data.get("character") or "").strip()
+    mode = (data.get("mode") or "").strip().lower()
+    if not char or mode not in ("auto", "players"):
+        return {"ok": False}, 400
+    pref = rt("roll_prefs.json")
+    try:
+        prefs = {}
+        if os.path.exists(pref):
+            with open(pref) as f:
+                prefs = json.load(f)
+        prefs[char] = mode
+        with open(pref, "w") as f:
+            json.dump(prefs, f)
+    except (OSError, ValueError):
+        pass
+    return {"ok": True, "character": char, "mode": mode}, 200
+
+
 # ─── Narrator voice (Gemini Flash TTS) ────────────────────────────────────────
 # Voice selection persists per-campaign in state.md → ## Session Flags →
 # `tts_voice: <name>`. Read at /index render, written by POST /voice.
@@ -2545,7 +2607,7 @@ if __name__ == "__main__":
     ssl_ctx = (_cert, _key) if (_TLS_MODE and os.path.exists(_cert) and os.path.exists(_key)) else None
     scheme  = "https" if ssl_ctx else "http"
 
-    # Write .scheme so push_stats.py / send.py / autorun-wait.sh know which to use
+    # Write .scheme so push_stats.py / send.py / autorun_wait.py know which to use
     try:
         with open(os.path.join(_display_dir, ".scheme"), "w") as _sf:
             _sf.write(scheme)
