@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "extraKnownMarketplaces": {
+    "neural-initiative": {
+      "source": {
+        "source": "local-path",
+        "path": "/opt/claude-dnd-skill"
+      }
+    }
+  },
+  "enabledPlugins": [
+    { "plugin": "dm", "marketplace": "neural-initiative" }
+  ]
+}
