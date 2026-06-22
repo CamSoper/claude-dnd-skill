@@ -38,6 +38,12 @@ AUTORUN_WAIT = os.path.join(DISPLAY, "autorun_wait.py")
 GIT_SYNC = os.path.join(SKILL_REPO, "docker", "git-sync.sh")
 IDLE_RESCAN_SECS = 30
 
+# Model the headless DM runs each turn. Overridable via DND_MODEL (set from the
+# Pulumi config in home-lab-iac → the container env); defaults to Sonnet — fast
+# and cheap enough for per-turn narration while staying on the subscription.
+# Accepts a Claude Code alias ("sonnet", "opus", "haiku") or a full model id.
+MODEL = os.environ.get("DND_MODEL", "").strip() or "sonnet"
+
 
 def _load_sanitize():
     """Reuse wrapper.py._sanitize (structural [Name]: action validation + strip)."""
@@ -116,6 +122,7 @@ def run_turn(campaign: str, moves: str) -> None:
     env.setdefault("CLAUDE_SKILL_DIR", SKILL)
     cmd = [
         "claude", "-p", moves,
+        "--model", MODEL,
         "--append-system-prompt", SYSTEM_PROMPT.format(campaign=campaign),
         "--dangerously-skip-permissions",
     ]
