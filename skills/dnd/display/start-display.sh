@@ -10,13 +10,23 @@
 # TLS adds encryption but requires a one-time certificate install on each device.
 
 DISPLAY_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG="$DISPLAY_DIR/app.log"               # process log — recreated each launch
-PID_FILE="$DISPLAY_DIR/app.pid"          # process pid  — recreated each launch
-CERT_SERVER_PID="$DISPLAY_DIR/.cert-server.pid"
 # Writable runtime dir (update-safe) — TLS certs live here so they survive
 # /plugin update and devices don't have to re-trust them. Resolve via paths.py.
 RT="$(python3 -c "import sys,os;sys.path.insert(0,os.path.join('$DISPLAY_DIR','..','scripts'));from paths import runtime_dir;print(runtime_dir())" 2>/dev/null)"
 [ -z "$RT" ] && { RT="${DND_CAMPAIGN_ROOT:-$HOME/.claude/dnd}/.runtime"; mkdir -p "$RT"; }
+
+# Process-management files (recreated every launch). These normally live in the
+# code dir, but in read-only deployments — e.g. the Docker host image, where
+# /opt/claude-dnd-skill is owned by root and the game runs as the unprivileged
+# `node` user — the code dir isn't writable, so creating app.log here aborts the
+# `nohup … > "$LOG"` launch and the display never starts (502 behind the tunnel).
+# Recreating these files needs write permission on the DIRECTORY (they are rm -f'd
+# then rewritten), so fall back to the writable runtime dir when it isn't granted.
+PROC_DIR="$DISPLAY_DIR"
+[ -w "$PROC_DIR" ] || PROC_DIR="$RT"
+LOG="$PROC_DIR/app.log"               # process log — recreated each launch
+PID_FILE="$PROC_DIR/app.pid"          # process pid  — recreated each launch
+CERT_SERVER_PID="$PROC_DIR/.cert-server.pid"
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
 LAN_FLAG=""
