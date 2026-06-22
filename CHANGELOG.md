@@ -10,6 +10,8 @@ Versions before **1.6.0** are reconstructed retroactively from git history; the 
 
 ## [Unreleased]
 
+- **Fixed `dnd.soper.ninja` SSE stream returning 502 behind Cloudflare.** The `/stream` handler set `Transfer-Encoding: chunked` manually, but Werkzeug already adds that header when it auto-chunks the streamed response — so the reply went out with a *duplicate* `Transfer-Encoding` header. `cloudflared`'s strict HTTP parser (Go `net/http`: "too many transfer encodings") rejected it with an immediate 502, so the display loaded but its `EventSource` never connected: no live updates arrived and actions appeared to get no response. Removed the manual header and let the WSGI server own transfer framing (matches the dice-server SSE endpoint). Local LAN play and direct browser access are unaffected.
+
 ## [2.2.1] — 2026-06-18 — Multi-column PDF import (chapter segmentation fix)
 
 - **Imported PDFs no longer collapse into one chapter.** Most published modules are two-column, and the extractor used `pdftotext -layout`, which preserves physical layout and **interleaves the columns** — scrambling reading order (keyed encounters came out 1, 2, 4, 3…) and burying section headers mid-line. Handed that, the import had nothing clean to segment on and lumped the whole book into a single chapter. PDF extraction now uses **PyMuPDF column-aware ordering**: text blocks are sorted into true reading order (left column then right, with full-width headers acting as band dividers), so section headers and keyed encounters come out clean and in sequence and chapter segmentation works on large modules. Verified on an 82-page, 38k-word anthology that previously collapsed.

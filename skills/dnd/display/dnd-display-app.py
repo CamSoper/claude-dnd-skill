@@ -2621,7 +2621,11 @@ def stream():
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Transfer-Encoding": "chunked",
+            # Do NOT set "Transfer-Encoding: chunked" here. Werkzeug already adds it
+            # when it auto-chunks this streamed (Content-Length-less) response, so
+            # setting it manually emits a DUPLICATE Transfer-Encoding header. Strict
+            # HTTP parsers (cloudflared/Go net/http: "too many transfer encodings")
+            # reject that and return an immediate 502 on /stream behind the tunnel.
         },
     )
     # Force a single authoritative Connection header — Werkzeug otherwise
