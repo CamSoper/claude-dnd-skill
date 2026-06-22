@@ -1221,6 +1221,72 @@ def health():
     }, 200
 
 
+# ─── Party roster (phone character picker) ────────────────────────────────────
+# The display only learns the full party from a live push_stats /stats POST, which
+# the DM runs during a turn. In the headless deployment (docker/dnd_loop.py) no
+# turn runs before the first player move — but a player can't submit a move until
+# they pick their character on the phone first-screen picker. Without a roster the
+# picker hangs on "Loading party…", so the first move never happens (chicken-and-
+# egg). /party reads the roster straight from disk so the picker can populate and
+# the player can join even before any turn has pushed stats.
+
+_PARTY_LINE_RE = re.compile(r"\*\*Party:\*\*\s*(.+)")
+
+
+def _party_from_state(camp: str) -> list:
+    """Best-effort PC names from the state.md `**Party:**` line(s).
+
+    Only used as a fallback when characters/ is absent/empty. A party entry looks
+    like `<Name> — <Race> <Class> <Level> | HP …`; the name is the text before the
+    first em/en dash or pipe (NOT the ASCII hyphen — names may contain one, e.g.
+    "Jean-Luc"). Multiple PCs may be separated by `;`.
+    """
+    try:
+        text = (_find_campaign(camp) / "state.md").read_text(errors="replace")
+    except (OSError, ValueError):
+        return []
+    names: list = []
+    for m in _PARTY_LINE_RE.finditer(text):
+        for piece in re.split(r"\s*;\s*", m.group(1)):
+            name = re.split(r"\s*[—–|]\s*", piece, maxsplit=1)[0].strip()
+            if name and not name.startswith("<") and name not in names:
+                names.append(name[:48])
+    return names
+
+
+@app.route("/party")
+def party():
+    """Return the active campaign's PC roster names for the phone picker.
+
+    Resolution order:
+      1. live _current_stats players (authoritative once a turn has pushed them),
+      2. campaign characters/<Name>.md stems,
+      3. the state.md `**Party:**` line.
+    No auth — exposes only PC display names, which already appear on the shared
+    display. Returns {"players": [{"name": str}, ...]} (possibly empty).
+    """
+    with _stats_lock:
+        live = [p.get("name") for p in _current_stats.get("players", []) if p.get("name")]
+    if live:
+        return jsonify({"players": [{"name": n} for n in live]})
+
+    camp = _active_campaign_name() or ""
+    if not camp:
+        return jsonify({"players": []})
+
+    names: list = []
+    try:
+        cdir = _find_campaign(camp) / "characters"
+        if cdir.is_dir():
+            names = sorted(p.stem for p in cdir.glob("*.md") if p.is_file())
+    except Exception:
+        names = []
+    if not names:
+        names = _party_from_state(camp)
+
+    return jsonify({"players": [{"name": n} for n in names]})
+
+
 @app.route("/chunk", methods=["POST"])
 def chunk():
     if not _token_ok():

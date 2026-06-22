@@ -4741,7 +4741,7 @@ function renderNPCBlock(name, text, isReplay) {
     block.appendChild(p);
   });
 
-  _addTtsBar(block);
+  _addTtsBar(block, { autoplay: !isReplay });
   textContent.appendChild(block);
   _reanchorCursor();
 }
@@ -4979,7 +4979,7 @@ function renderReplayBatch(items) {
         _appendInlineSegments(p, _mdParse(line));
         block.appendChild(p);
       });
-      _addTtsBar(block);
+      _addTtsBar(block, { autoplay: false });
       textContent.appendChild(block);
     }
   });
@@ -5087,7 +5087,7 @@ function renderReplay(text) {
     _appendInlineSegments(p, _mdParse(line));
     block.appendChild(p);
   });
-  _addTtsBar(block);
+  _addTtsBar(block, { autoplay: false });
   textContent.appendChild(block);
 
   // Add a divider after replay so live text starts fresh
@@ -6309,7 +6309,33 @@ function _ttsBuildVoiceMenu() {
   return menu;
 }
 
-function _addTtsBar(blockEl) {
+// Auto-narrate serialization — never fire a burst of concurrent /tts requests.
+// The Gemini preview-TTS model rate-limits hard; a flood (e.g. replaying a long
+// session log, or rapid live blocks) returns 429/5xx, which the server maps to a
+// 502. Funnel every auto-narrate play through a one-at-a-time FIFO so at most one
+// /tts fetch is in flight; manual play-button clicks stay immediate.
+let _ttsAutoBusy = false;
+const _ttsAutoQueue = [];
+function _ttsEnqueueAuto(btn, blockEl) {
+  _ttsAutoQueue.push([btn, blockEl]);
+  _ttsDrainAuto();
+}
+async function _ttsDrainAuto() {
+  if (_ttsAutoBusy) return;
+  const job = _ttsAutoQueue.shift();
+  if (!job) return;
+  _ttsAutoBusy = true;
+  try { await _ttsPlayBlock(job[0], job[1]); } catch (e) { /* degrade silently */ }
+  _ttsAutoBusy = false;
+  _ttsDrainAuto();
+}
+
+// opts.autoplay (default true): when false, the bar is added with its manual play
+// button but auto-narrate does NOT fire for this block. Replayed/historical blocks
+// pass {autoplay:false} so reconnecting never reads the whole backlog aloud (and
+// never floods /tts); only new live narration auto-plays.
+function _addTtsBar(blockEl, opts) {
+  opts = opts || {};
   if (!_TTS_AVAILABLE || !blockEl) return;
   if (blockEl.querySelector(':scope > .tts-bar')) return;  // already added
 
@@ -6341,9 +6367,10 @@ function _addTtsBar(blockEl) {
 
   blockEl.appendChild(bar);
 
-  if (_ttsAutoNarrate) {
-    // Defer one tick so the bar is in the DOM before triggering the click path
-    setTimeout(() => _ttsPlayBlock(playBtn, blockEl), 0);
+  if (_ttsAutoNarrate && opts.autoplay !== false) {
+    // Defer one tick so the bar is in the DOM before triggering the click path,
+    // and serialize through the auto-narrate queue (see _ttsEnqueueAuto).
+    setTimeout(() => _ttsEnqueueAuto(playBtn, blockEl), 0);
   }
 }
 
@@ -7478,11 +7505,36 @@ function _refreshCharSelect() {
   });
 }
 
+// Disk-roster fallback for the phone picker. The picker normally fills from the
+// SSE `stats` event, but in the headless deployment no turn has pushed stats yet
+// when the first player connects — so pull the roster from /party (which reads
+// the campaign's characters/ on disk) so they can still pick a character and
+// trigger the first turn. A real `stats` event always wins the race; we only
+// populate while the cache is still empty.
+function _fetchPartyFallback(retriesLeft) {
+  if (_modePlayersCache && _modePlayersCache.length) return;
+  fetch('/party')
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => {
+      const players = data && Array.isArray(data.players) ? data.players : [];
+      if (!players.length) {
+        if (retriesLeft > 0) setTimeout(() => _fetchPartyFallback(retriesLeft - 1), 3000);
+        return;
+      }
+      if (_modePlayersCache && _modePlayersCache.length) return;  // SSE stats won
+      _modeSwitcherCachePlayers(players);   // populates cache + refreshes the picker
+    })
+    .catch(() => {
+      if (retriesLeft > 0) setTimeout(() => _fetchPartyFallback(retriesLeft - 1), 3000);
+    });
+}
+
 function _initCharSelect() {
   const cs = document.getElementById('char-select');
   if (!cs) return;
   cs.hidden = false;
   _refreshCharSelect();
+  _fetchPartyFallback(1);   // seed the picker from disk if no stats have arrived
   const back = document.getElementById('cs-back');
   if (back) back.addEventListener('click', () => {
     const url = new URL(window.location.href);

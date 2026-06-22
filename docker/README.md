@@ -84,6 +84,7 @@ docker run --rm -v "$PWD/auth:/home/node/.claude" \
 | `GITHUB_TOKEN` | Scoped PAT/deploy token for clone/pull/push. |
 | `DND_TTS_KEY` | Gemini Flash TTS key (narration audio). Optional → text-only. |
 | `DND_CAMPAIGN` | Campaign the driver loads (default: most-recently-played). |
+| `DND_MODEL` | Model the DM runs each turn — alias (`sonnet`/`opus`/`haiku`) or full id. Default `sonnet`. Set from the Pulumi config in home-lab-iac. |
 | `ANTHROPIC_API_KEY` | **Optional.** Set to bill at API rates instead of the subscription. **Do NOT** set `CLAUDE_CODE_OAUTH_TOKEN`. |
 
 ## Authoring campaigns (you, locally — not on the server)
